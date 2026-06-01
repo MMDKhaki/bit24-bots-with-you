@@ -1,8 +1,8 @@
 """
 ADA/IRT DCA Trading Bot — Bit24 Exchange
-Strategy: 3-step grid entry with independent take-profit per position
-API Docs : https://docs.bit24.cash/#api-24
-Repo     : https://github.com/shayanghad0/Bit24-Easy-To-use
+Strategy  : 3-step grid entry with independent take-profit per position
+API Docs  : https://docs.bit24.cash/#api-24
+Main Repo : https://github.com/shayanghad0/Bit24-Easy-To-use
 """
 
 import requests
@@ -32,6 +32,12 @@ TP_GRID2   = 0.010        # +1.0 %
 
 POLL_INTERVAL = 3         # seconds between market checks
 
+# Network resilience
+TIMEOUT        = 10       # seconds per request
+MAX_RETRIES    = 4        # attempts before giving up
+RETRY_BACKOFF  = 2.0      # seconds; doubles each retry (2 → 4 → 8 …)
+MAX_TIMEOUTS   = 10       # consecutive timeouts before emergency shutdown
+
 BASE_URL_PRO   = "https://rest.bit24.cash/pro/capi/v1"
 BASE_URL_ASSET = "https://rest.bit24.cash/asset/capi/v1"
 
@@ -54,6 +60,7 @@ positions = {
 }
 
 trade_log = []
+consecutive_timeouts = 0   # incremented on network failure, reset on success
 
 
 # ─────────────────────────────────────────────
@@ -69,7 +76,7 @@ def sign(params: dict, secret: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  HTTP HELPERS
+#  HTTP HELPERS  (with retry + backoff)
 # ─────────────────────────────────────────────
 def _headers() -> dict:
     return {
@@ -79,23 +86,59 @@ def _headers() -> dict:
     }
 
 
+def _request(method: str, url: str, **kwargs) -> dict:
+    """
+    Wraps requests.get/post with exponential-backoff retry.
+
+    Retries on:  Timeout, ConnectionError, HTTP 5xx
+    Does NOT retry on: 4xx (bad request / auth — retrying won't help)
+
+    Raises RuntimeError after MAX_RETRIES exhausted so callers can handle
+    gracefully instead of crashing the whole bot.
+    """
+    global consecutive_timeouts
+    delay = RETRY_BACKOFF
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, timeout=TIMEOUT, **kwargs)
+
+            # 5xx → transient server error, worth retrying
+            if resp.status_code >= 500:
+                raise requests.exceptions.ConnectionError(
+                    f"HTTP {resp.status_code} from server"
+                )
+
+            consecutive_timeouts = 0      # successful network contact
+            return resp.json()
+
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as exc:
+            consecutive_timeouts += 1
+            if attempt == MAX_RETRIES:
+                raise RuntimeError(
+                    f"Network error after {MAX_RETRIES} attempts: {exc}"
+                ) from exc
+
+            wait = delay * (2 ** (attempt - 1))   # 2 s, 4 s, 8 s …
+            print(f"\n[RETRY {attempt}/{MAX_RETRIES}] {exc}  — waiting {wait:.0f}s")
+            time.sleep(wait)
+
+
 def get(path: str, params: dict = None) -> dict:
-    url = BASE_URL_PRO + path
-    resp = requests.get(url, params=params, headers=_headers(), timeout=10)
-    return resp.json()
+    return _request("GET", BASE_URL_PRO + path,
+                    params=params, headers=_headers())
 
 
 def post(path: str, params: dict, base: str = BASE_URL_PRO) -> dict:
     params["signature"] = sign(params, SECRET_KEY)
-    url = base + path
-    resp = requests.post(url, data=params, headers=_headers(), timeout=10)
-    return resp.json()
+    return _request("POST", base + path,
+                    data=params, headers=_headers())
 
 
 def asset_get(path: str, params: dict = None) -> dict:
-    url = BASE_URL_ASSET + path
-    resp = requests.get(url, params=params, headers=_headers(), timeout=10)
-    return resp.json()
+    return _request("GET", BASE_URL_ASSET + path,
+                    params=params, headers=_headers())
 
 
 # ─────────────────────────────────────────────
@@ -281,8 +324,44 @@ def check_fills() -> None:
                 save_tp_state()
 
 
-def check_take_profits(bid: float) -> None:
-    """Trigger market sells when best bid crosses a TP target."""
+def _cancel_unfilled() -> None:
+    """Cancel every limit order that was never filled."""
+    for name, pos in positions.items():
+        if pos["order_id"] and not pos["filled"] and not pos["tp_done"]:
+            print(f"[CANCEL UNFILLED] {name}  order_id={pos['order_id']}")
+            cancel_order(pos["order_id"])
+            log_trade("cancel_unfilled", {"position": name,
+                                          "order_id": pos["order_id"]})
+
+
+def _all_filled_tps_done() -> bool:
+    """
+    True when every position that was actually filled has completed its TP.
+    Unfilled limit orders are ignored — they will be cancelled, not sold.
+
+    Rule matrix:
+      filled positions        → must all have tp_done=True to return True
+      unfilled limit orders   → skipped entirely
+    """
+    return all(
+        pos["tp_done"]
+        for pos in positions.values()
+        if pos["filled"]
+    )
+
+
+def check_take_profits(bid: float) -> bool:
+    """
+    Trigger market sells when best bid crosses a TP target.
+    Returns True when the session is complete (all filled TPs done).
+
+    Close logic:
+      • Only positions with filled=True are eligible for TP sell.
+      • When the last filled position hits its TP:
+          1. Execute the sell.
+          2. Cancel any remaining unfilled limit orders.
+          3. Return True → caller breaks the loop.
+    """
     for name, pos in positions.items():
         if pos["filled"] and not pos["tp_done"] and pos["tp_price"]:
             if bid >= pos["tp_price"]:
@@ -298,6 +377,11 @@ def check_take_profits(bid: float) -> None:
                         "order_id": result["id"],
                     })
                     save_tp_state()
+
+    if _all_filled_tps_done():
+        _cancel_unfilled()
+        return True
+    return False
 
 
 def run() -> None:
@@ -354,17 +438,28 @@ def run() -> None:
             bid = get_best_bid()
             if bid:
                 check_fills()
-                check_take_profits(bid)
+                session_complete = check_take_profits(bid)
 
-                done = sum(1 for p in positions.values() if p["tp_done"])
-                print(f"  bid={int(bid):,}  TP done={done}/3", end="\r")
+                filled_count = sum(1 for p in positions.values() if p["filled"])
+                done_count   = sum(1 for p in positions.values() if p["tp_done"])
+                print(f"  bid={int(bid):,}  filled={filled_count}/3  TP={done_count}/{filled_count}  timeouts={consecutive_timeouts}", end="\r")
 
-                if done == 3:
-                    print("\n[DONE] All three positions closed. Bot finished.")
+                if session_complete:
+                    print("\n[DONE] All filled positions closed. Bot finished.")
                     save_tp_state()
-                    break
+                    _save_json(TRADE_LOG, trade_log)
+                    sys.exit(0)
+
+        except RuntimeError as exc:
+            # _request raised after exhausting all retries
+            print(f"\n[WARN] {exc}")
+            if consecutive_timeouts >= MAX_TIMEOUTS:
+                print(f"[FATAL] {consecutive_timeouts} consecutive network failures. "
+                      "Triggering emergency shutdown to protect positions.")
+                shutdown()
+
         except Exception as exc:
-            print(f"\n[WARN] Loop error: {exc}")
+            print(f"\n[WARN] Unexpected error: {exc}")
 
         time.sleep(POLL_INTERVAL)
 
